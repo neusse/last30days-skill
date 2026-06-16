@@ -16,6 +16,12 @@ The Python script (`scripts/last30days.py`) the Skill's SKILL.md invokes to do t
 
 The agent runtime that loads Skills and invokes them on the user's behalf. Claude Code is the most common Harness for this Skill but not the only one — Codex, Cursor, GitHub Copilot, Gemini CLI, and the rest of the Agent Skills ecosystem also count. "Multi-harness" describes a Skill that works correctly across every Harness it installs into; features written without multi-harness awareness (e.g., engine flags with no SKILL.md integration, or paths hardcoded to one Harness's install layout) regress on Harnesses other than the one they were tested against.
 
+## Research concepts
+
+### Hiring Signals
+
+Evidence-backed interpretation of current public job postings as indicators of a company's focus, priority shifts, or investment areas. Hiring Signals describe strategic leaning, not exact roadmap predictions, and are weighted by company size because a role at an early-stage startup carries more company-level signal than a scattered role at a large enterprise.
+
 ## Distribution
 
 ### Beta channel

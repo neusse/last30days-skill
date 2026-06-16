@@ -21,7 +21,9 @@ from . import (
     github,
     grounding,
     hackernews,
+    hiring_signals,
     instagram,
+    jobs,
     normalize,
     perplexity,
     pinterest,
@@ -63,7 +65,7 @@ SEARCH_ALIAS = {
     "xquik": "xquik",
 }
 
-MAX_SOURCE_FETCHES: dict[str, int] = {"x": 2}
+MAX_SOURCE_FETCHES: dict[str, int] = {"x": 2, "jobs": 1}
 
 MOCK_AVAILABLE_SOURCES = [
     "reddit",
@@ -83,6 +85,7 @@ MOCK_AVAILABLE_SOURCES = [
     "pinterest",
     "xquik",
     "digg",
+    "jobs",
 ]
 
 
@@ -118,6 +121,8 @@ def available_sources(config: dict[str, Any], requested_sources: list[str] | Non
         available.append("truthsocial")
     if config.get("BRAVE_API_KEY") or config.get("EXA_API_KEY") or config.get("SERPER_API_KEY") or config.get("PARALLEL_API_KEY"):
         available.append("grounding")
+    if requested_sources and "jobs" in requested_sources:
+        available.append("jobs")
     # Perplexity Sonar: opt-in additive source via INCLUDE_SOURCES=perplexity
     include_sources = (config.get("INCLUDE_SOURCES") or "").lower().split(",")
     if config.get("OPENROUTER_API_KEY") and (
@@ -190,6 +195,7 @@ def run(
     lookback_days: int = 30,
     github_user: str | None = None,
     github_repos: list[str] | None = None,
+    hiring_signals_mode: bool = False,
     internal_subrun: bool = False,
 ) -> schema.Report:
     settings = DEPTH_SETTINGS[depth]
@@ -200,6 +206,8 @@ def run(
         runtime = providers.mock_runtime(config, depth)
         reasoning_provider = None
         available = list(requested_sources or MOCK_AVAILABLE_SOURCES)
+        if not requested_sources and not hiring_signals_mode and not _company_topic_likely(topic):
+            available = [source for source in available if source != "jobs"]
     else:
         runtime, reasoning_provider = providers.resolve_runtime(config, depth)
         available = available_sources(config, requested_sources)
@@ -209,21 +217,32 @@ def run(
         available = [s for s in available if s != "grounding"]
     elif web_backend in ("brave", "exa", "serper", "parallel") and "grounding" not in available:
         available.append("grounding")
+    if (hiring_signals_mode or _company_topic_likely(topic)) and "jobs" not in available:
+        available.append("jobs")
+    if hiring_signals_mode:
+        config = dict(config)
+        config["_hiring_signals_mode"] = True
+        if not requested_sources:
+            available = ["jobs"]
     if not available:
         raise RuntimeError("No sources are available for this run.")
+
+    planner_requested_sources = requested_sources
+    if hiring_signals_mode and not planner_requested_sources:
+        planner_requested_sources = ["jobs"]
 
     if external_plan:
         # External plan provided (e.g., from Claude Code via --plan flag).
         # Parse it through the same sanitizer to validate structure.
         plan = planner._sanitize_plan(
-            external_plan, topic, available, requested_sources, depth,
+            external_plan, topic, available, planner_requested_sources, depth,
         )
         plan_source = "external"
     else:
         plan = planner.plan_query(
             topic=topic,
             available_sources=available,
-            requested_sources=requested_sources,
+            requested_sources=planner_requested_sources,
             depth=depth,
             provider=None if mock else reasoning_provider,
             model=None if mock else runtime.planner_model,
@@ -246,6 +265,7 @@ def run(
         for sq in plan.subqueries:
             if "grounding" not in sq.sources:
                 sq.sources.append("grounding")
+    _ensure_jobs_in_plan(plan, available, explicit=hiring_signals_mode, topic=topic)
 
     # Always-on planner trace. Emits one summary line plus one per subquery
     # so retrieval-breadth failures like the 2026-04-19 Hermes Agent Use Cases
@@ -455,6 +475,14 @@ def run(
         if bundle.items_by_source.get(source):
             del bundle.errors_by_source[source]
 
+    hiring_summary = _apply_hiring_signal_gate(
+        bundle,
+        explicit=hiring_signals_mode,
+        topic=topic,
+    )
+    if hiring_summary:
+        bundle.artifacts["hiring_signals"] = hiring_summary
+
     items_by_source = _finalize_items_by_source(bundle.items_by_source, topic=topic, config=config)
     candidates = weighted_rrf(bundle.items_by_source_and_query, plan, pool_limit=settings["pool_limit"])
     ranked_candidates = rerank.rerank_candidates(
@@ -514,7 +542,8 @@ def _normalize_score_dedupe(
     )
     prepared_query = relevance.PreparedQuery(ranking_query)
     normalized = signals.annotate_stream(normalized, prepared_query, freshness_mode)
-    normalized = signals.prune_low_relevance(normalized)
+    if source != "jobs":
+        normalized = signals.prune_low_relevance(normalized)
     normalized = dedupe.dedupe_items(normalized)
     for item in normalized:
         item.snippet = snippet.extract_best_snippet(item, prepared_query)
@@ -550,6 +579,63 @@ def _finalize_items_by_source(
             digg.enrich_source_items(items, top_k=3)
         finalized[source] = items
     return finalized
+
+
+def _apply_hiring_signal_gate(
+    bundle: schema.RetrievalBundle,
+    *,
+    explicit: bool,
+    topic: str,
+) -> dict[str, Any] | None:
+    jobs_items = bundle.items_by_source.get("jobs") or []
+    if not jobs_items:
+        if explicit:
+            return hiring_signals.analyze([], explicit=True, topic=topic)
+        return None
+
+    summary = hiring_signals.analyze(jobs_items, explicit=explicit, topic=topic)
+    if not explicit and not summary.get("include"):
+        bundle.items_by_source.pop("jobs", None)
+        for key in list(bundle.items_by_source_and_query):
+            if key[1] == "jobs":
+                del bundle.items_by_source_and_query[key]
+    return summary
+
+
+def _ensure_jobs_in_plan(
+    plan: schema.QueryPlan,
+    available: list[str],
+    *,
+    explicit: bool,
+    topic: str,
+) -> None:
+    if "jobs" not in available:
+        return
+    if not (explicit or _company_topic_likely(topic)):
+        return
+    if "jobs" not in plan.source_weights:
+        plan.source_weights["jobs"] = 1.0
+    for subquery in plan.subqueries:
+        if "jobs" not in subquery.sources:
+            subquery.sources.append("jobs")
+
+
+def _company_topic_likely(topic: str) -> bool:
+    text = topic.strip()
+    if not text:
+        return False
+    lower = text.lower()
+    if " vs " in lower or " versus " in lower:
+        return True
+    if "?" in text or len(text.split()) > 4:
+        return False
+    generic = {
+        "how", "what", "why", "best", "top", "tutorial", "guide", "prompts",
+        "news", "latest", "ideas", "examples",
+    }
+    if any(word in generic for word in lower.split()):
+        return False
+    return bool(text[:1].isupper() or len(text.split()) == 1)
 
 
 def _warnings(
@@ -869,6 +955,15 @@ def _retrieve_stream(
     if source == "grounding":
         return grounding.web_search(
             subquery.search_query, date_range, config, backend=web_backend)
+    if source == "jobs":
+        return jobs.search_jobs(
+            raw_topic or topic or subquery.search_query,
+            date_range,
+            config,
+            depth=depth,
+            web_backend=web_backend,
+            explicit=bool(config.get("_hiring_signals_mode")),
+        )
     if source == "reddit":
         # Use raw_topic so expand_reddit_queries() generates diverse variants
         # from the original user topic, not the planner's narrowed search_query.
@@ -1125,6 +1220,35 @@ def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[d
                 "posts": [],
                 "relevance": 0.71,
                 "why_relevant": "Mock Digg cluster",
+            },
+        ],
+        "jobs": [
+            {
+                "id": "J1",
+                "title": "Founding Enterprise Solutions Engineer",
+                "url": "https://boards.greenhouse.io/example/jobs/1",
+                "description": (
+                    f"Work with enterprise customers on SSO, SOC 2, security, "
+                    f"and procurement workflows for {subquery.search_query}."
+                ),
+                "department": "Sales",
+                "location": "San Francisco, CA",
+                "date": dates.get_date_range(4)[0],
+                "provider": "mock",
+                "relevance": 0.8,
+                "why_relevant": "Mock public job posting",
+            },
+            {
+                "id": "J2",
+                "title": "Security Platform Engineer",
+                "url": "https://boards.greenhouse.io/example/jobs/2",
+                "description": "Build enterprise security, audit, and admin workflows.",
+                "department": "Engineering",
+                "location": "Remote",
+                "date": dates.get_date_range(6)[0],
+                "provider": "mock",
+                "relevance": 0.78,
+                "why_relevant": "Mock public job posting",
             },
         ],
     }

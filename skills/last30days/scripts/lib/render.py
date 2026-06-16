@@ -70,6 +70,7 @@ SOURCE_LABELS = {
     "github": "GitHub",
     "digg": "Digg",
     "perplexity": "Perplexity",
+    "jobs": "Jobs",
 }
 
 
@@ -135,6 +136,10 @@ def render_compact(report: schema.Report, cluster_limit: int = 8, fun_level: str
     # block below) vs "synthesize from" (this block).
     lines.append("<!-- EVIDENCE FOR SYNTHESIS: read this, do not emit verbatim. Transform into `What I learned:` prose per LAW 2. -->")
     lines.append("")
+    hiring_block = _render_hiring_signals(report)
+    if hiring_block:
+        lines.extend(hiring_block)
+        lines.append("")
     lines.append("## Ranked Evidence Clusters")
     lines.append("")
     candidate_by_id = {candidate.candidate_id: candidate for candidate in report.ranked_candidates}
@@ -210,6 +215,10 @@ def render_for_html(
     ]
     if synthesis_md:
         lines.extend(["", synthesis_md.strip()])
+    else:
+        hiring_block = _render_hiring_signals(report)
+        if hiring_block:
+            lines.extend(["", *hiring_block])
     # Data quality warnings are NOT rendered into the HTML artifact. The HTML
     # is meant to be shared (Slack, email, Notion); recipients haven't asked
     # for technical commentary about how the run was produced. Generators see
@@ -842,7 +851,7 @@ def render_full(report: schema.Report) -> str:
     lines.append("## All Items by Source")
     lines.append("")
     source_order = ["reddit", "x", "youtube", "tiktok", "instagram", "threads", "pinterest",
-                    "hackernews", "bluesky", "truthsocial", "polymarket", "grounding", "xiaohongshu", "github", "digg", "perplexity"]
+                    "hackernews", "bluesky", "truthsocial", "polymarket", "grounding", "xiaohongshu", "github", "digg", "perplexity", "jobs"]
     for source in source_order:
         items = report.items_by_source.get(source, [])
         if not items:
@@ -959,6 +968,51 @@ def render_context(report: schema.Report, cluster_limit: int = 6) -> str:
         lines.append("Warnings:")
         lines.extend(f"- {warning}" for warning in report.warnings)
     return "\n".join(lines).strip() + "\n"
+
+
+def _render_hiring_signals(report: schema.Report) -> list[str]:
+    summary = report.artifacts.get("hiring_signals")
+    if not isinstance(summary, dict):
+        return []
+    signals = summary.get("signals") or []
+    include = bool(summary.get("include"))
+    mode = summary.get("mode") or "standard"
+    if not include and mode != "explicit":
+        return []
+
+    out = [
+        "## Hiring Signals",
+        "",
+        (
+            f"- Mode: {mode}; company-size tier: "
+            f"{summary.get('company_size_tier') or 'unknown'}"
+        ),
+    ]
+    if not signals:
+        reason = summary.get("omitted_reason") or "no reliable hiring signal found"
+        out.append(f"- No reliable hiring signal found: {reason}.")
+        return out
+
+    out.append(
+        "- Interpret these as focus or priority signals, not exact roadmap predictions."
+    )
+    for signal in signals[:4]:
+        evidence = signal.get("evidence") or []
+        out.append(
+            f"- {signal.get('theme', 'hiring theme')}: "
+            f"{signal.get('interpretation', 'possible hiring focus')} "
+            f"(confidence: {signal.get('confidence', 'low')}; "
+            f"evidence: {signal.get('evidence_count', len(evidence))} roles)"
+        )
+        for item in evidence[:3]:
+            title = item.get("title") or "Job posting"
+            url = item.get("url") or ""
+            dept = item.get("department") or ""
+            date = item.get("published_at") or "date unknown"
+            link = f"[{title}]({url})" if url else title
+            detail = " | ".join(part for part in [dept, date] if part)
+            out.append(f"  - {link}" + (f" ({detail})" if detail else ""))
+    return out
 
 
 def _render_candidate(candidate: schema.Candidate, prefix: str) -> list[str]:
